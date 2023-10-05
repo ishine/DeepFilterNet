@@ -19,7 +19,6 @@ FRAME_SIZE = 480
 INPUT_NAMES = [
     'input_frame', 
     'states',
-    'atten_lim_db'
 ]
 OUTPUT_NAMES = [
     'enhanced_audio_frame', 'out_states', 'lsnr'
@@ -53,7 +52,7 @@ def onnx_simplify(
     onnx.save_model(model_simp, path)
     return path
 
-def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
+def test_onnx_model(torch_model, ort_session, states):
     """
     Simple test that everything converted correctly
 
@@ -69,12 +68,12 @@ def test_onnx_model(torch_model, ort_session, states, atten_lim_db):
         input_frame = torch.randn(FRAME_SIZE)
 
         # torch
-        output_torch = torch_model(input_frame, states_torch, atten_lim_db)
+        output_torch = torch_model(input_frame, states_torch)
 
         # onnx
         output_onnx = ort_session.run(
             OUTPUT_NAMES,
-            generate_onnx_features([input_frame, states_onnx, atten_lim_db]),
+            generate_onnx_features([input_frame, states_onnx]),
         )
 
         for (x, y, name) in zip(output_torch, output_onnx, OUTPUT_NAMES):
@@ -133,28 +132,56 @@ def infer_onnx_model(streaming_pipeline, ort_session, inference_path):
     )    
 
 def main(args):
-    streaming_pipeline = TorchDFPipeline(always_apply_all_stages=args.always_apply_all_stages, device='cpu')
+    streaming_pipeline = TorchDFPipeline(device='cpu')
     torch_df = streaming_pipeline.torch_streaming_model
     states = streaming_pipeline.states
-    atten_lim_db = streaming_pipeline.atten_lim_db
 
     input_frame = torch.rand(FRAME_SIZE)
     input_features = (
-        input_frame, states, atten_lim_db
+        input_frame, states
     )
     torch_df(*input_features) # check model
 
-    torch_df_script = torch.jit.script(torch_df)
-    torch.onnx.export(
-        torch_df_script,
-        input_features,
-        args.output_path,
-        verbose=False,
-        input_names=INPUT_NAMES,
-        output_names=OUTPUT_NAMES,
-        opset_version=14
+    from torch._export import capture_pre_autograd_graph
+
+    exported_mod = capture_pre_autograd_graph(torch_df, input_features)
+    from torch.ao.quantization.quantize_pt2e import (
+        prepare_pt2e,
+        convert_pt2e,
+    )
+
+    from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+        XNNPACKQuantizer,
+        get_symmetric_quantization_config
+    )
+
+    quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config())
+    exported_mod = prepare_pt2e(exported_mod, quantizer)
+    exported_mod = convert_pt2e(exported_mod)
+
+    # import torch.ao.quantization.quantize_fx as quantize_fx
+    # from torch.ao.quantization import get_default_qconfig_mapping
+
+    # torch_df.qconfig = torch.ao.quantization.get_default_qconfig('x86')
+    # qconfig_mapping = get_default_qconfig_mapping("qnnpack")
+    # torch_df_script = quantize_fx.prepare_fx(torch_df, qconfig_mapping, input_features)
+    # torch_df_script = quantize_fx.convert_fx(torch_df_script)
+    # torch_df_script = quantize_fx.fuse_fx(torch_df_script)
+
+    # raise Exception()
+
+    # torch_df_script = torch.jit.script(torch_df_script)
+    torch.onnx.dynamo_export(
+        exported_mod,
+        *input_features,
+        # args.output_path,
+        # verbose=False,
+        # input_names=INPUT_NAMES,
+        # output_names=OUTPUT_NAMES,
+        # opset_version=17
     )
     print(f'Model exported to {args.output_path}!')
+    raise Exception()
 
     input_features_onnx = generate_onnx_features(input_features)
     input_shapes_dict = {
@@ -194,7 +221,7 @@ def main(args):
     print(f'InferenceSession successful! Output shapes: {[x.shape for x in onnx_outputs]}')
 
     if args.test:
-        test_onnx_model(torch_df, ort_session, input_features[1], input_features[2])
+        test_onnx_model(torch_df, ort_session, input_features[1])
         print('Tests passed!')
 
     if args.performance:
